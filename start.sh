@@ -92,6 +92,17 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"   # fp8 needs files/patch_qsa_fp8_kv.py,
 # vLLM pick a smaller attention block. Empty keeps the checkpoint's float32.
 MAMBA_SSM_CACHE_DTYPE="${MAMBA_SSM_CACHE_DTYPE:-}"
 PLE_OFFLOAD="${PLE_OFFLOAD:-false}"
+# TP2 memory safety (see tp1/start.sh for the same rails at TP1). On unified
+# memory an exhausted pool hangs the kernel instead of OOM-killing, and gx10a
+# has NO swap, so these are load-bearing whenever PLE offload is on.
+#   CONTAINER_MEM_GIB     hard cgroup cap per container (host-side footprint:
+#                         Python procs, pinned buffers, page cache). GPU side is
+#                         bounded separately by --gpu-memory-utilization.
+#   MEMWATCH_MIN_GIB      watchdog floor: kill the container when host
+#                         MemAvailable drops below this (a polller cannot catch
+#                         a GiB/s collapse alone; the cgroup cap is the real bound).
+CONTAINER_MEM_GIB="${CONTAINER_MEM_GIB:-0}"       # 0 = no cap (previous behaviour)
+MEMWATCH_MIN_GIB="${MEMWATCH_MIN_GIB:-6}"
 # Vision MLP intermediate_size=4304 is not divisible by 16 after TP split (4304/2=2152).
 # NVFP4 kernels require input features % 16 == 0, so replicate the encoder on each GPU.
 MM_ENCODER_TP_MODE="${MM_ENCODER_TP_MODE:-data}"
@@ -700,6 +711,7 @@ if $DO_LAUNCH; then
     HEAD_PLE_OFFLOAD_MOUNTS=""
     WORKER_PLE_OFFLOAD_MOUNTS=""
     PLE_PACKED_ENV=""
+    PLE_MULTINODE_ENV=""
     if [[ "$PLE_OFFLOAD" == "true" ]]; then
         info "=== Step 6c: PLE CPU-offload wiring ==="
 
@@ -713,6 +725,26 @@ if $DO_LAUNCH; then
             docker rm "$tmp_container" >/dev/null 2>&1
         fi
         python3 "$SCRIPT_DIR/files/patch_ple_offload.py" >/dev/null || err "patch_ple_offload.py failed"
+
+        # Multi-node escape hatch: the stock guard rejects nnodes>1, but the
+        # offload path is node-local (each GPU worker spawns its own offload
+        # process; per-node zmq ipc; local file_system shm). Minimal one-hunk
+        # patch, opt-in via VLLM_PLE_OFFLOAD_ALLOW_MULTINODE=1.
+        if [[ "$TENSOR_PARALLEL_SIZE" -gt 1 ]] || [[ "$PLE_ALLOW_MULTINODE" == "true" ]]; then
+            if [[ ! -f "$SCRIPT_DIR/files/gpu_worker/gpu_worker.py.orig" ]]; then
+                info "Extracting gpu_worker.py from image..."
+                _c=$(docker create "$IMAGE" /bin/true)
+                docker cp "$_c:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py" "$SCRIPT_DIR/files/gpu_worker/gpu_worker.py.orig"
+                docker rm "$_c" >/dev/null 2>&1
+            fi
+            python3 "$SCRIPT_DIR/files/patch_gpu_worker_ple_nnodes.py" >/dev/null || err "patch_gpu_worker_ple_nnodes.py failed"
+            _GW="$VLLM_PKG/v1/worker/gpu_worker.py"
+            HEAD_PLE_OFFLOAD_MOUNTS+=" -v $SCRIPT_DIR/files/gpu_worker/gpu_worker.py:$_GW:ro"
+            scp -q "$SCRIPT_DIR/files/gpu_worker/gpu_worker.py" "${WORKER_USER:+${WORKER_USER}@}${WORKER_IP}:/tmp/ple_offload_gpu_worker.py"
+            WORKER_PLE_OFFLOAD_MOUNTS+=" -v /tmp/ple_offload_gpu_worker.py:$_GW:ro"
+            PLE_MULTINODE_ENV="-e VLLM_PLE_OFFLOAD_ALLOW_MULTINODE=1"
+            ok "PLE offload multinode guard patch applied (TP=$TENSOR_PARALLEL_SIZE)"
+        fi
 
         PLE_OFFLOAD_PKG="$VLLM_PKG/v1/ple_offload"
         PLE_LAYER_PKG="$VLLM_PKG/model_executor/layers/ple_offload_layer.py"
@@ -871,6 +903,9 @@ print(json.dumps({"text_config": tc}, separators=(",", ":")) if tc else "")
         DOCKER_ARGS+=("$PLE_PACKED_ENV")
         DOCKER_ARGS+=("-v" "$PLE_PACKED_TABLE_DIR:$PLE_PACKED_TABLE_DIR:ro")
     fi
+    if [[ -n "$PLE_MULTINODE_ENV" ]]; then
+        DOCKER_ARGS+=("$PLE_MULTINODE_ENV")
+    fi
     DOCKER_ARGS+=("-e HF_HOME=/root/.cache/huggingface")
     DOCKER_ARGS+=("-v $HF_CACHE_DIR:/root/.cache/huggingface")
     DOCKER_ARGS+=("-v $HOME/.cache/vllm:/root/.cache/vllm")
@@ -961,6 +996,14 @@ print(json.dumps({"text_config": tc}, separators=(",", ":")) if tc else "")
     PLE_OFFLOAD_ENV=""
     [[ "$PLE_OFFLOAD" == "true" ]] && PLE_OFFLOAD_ENV="-e VLLM_PLE_CPU_OFFLOAD=1"
 
+    # Container cgroup cap (both nodes) when set. GPU allocations are NOT
+    # charged to the cgroup on GB10, so this bounds the host-side footprint.
+    MEM_CAP_FLAG=""
+    if [[ "$CONTAINER_MEM_GIB" -gt 0 ]]; then
+        MEM_CAP_FLAG="--memory ${CONTAINER_MEM_GIB}g --memory-swap ${CONTAINER_MEM_GIB}g"
+        info "  container cgroup cap: ${CONTAINER_MEM_GIB} GiB/node"
+    fi
+
     # Write worker launch script to a temp file and scp it (avoids SSH JSON quoting issues)
     WORKER_SCRIPT=$(mktemp /tmp/vllm_worker_XXXXXX.sh)
     cat > "$WORKER_SCRIPT" <<LAUNCH_EOF
@@ -969,6 +1012,7 @@ docker run \
     -d --name vllm-fn \
     --gpus all --network host --ipc host \
     --cap-add SYS_NICE --ulimit memlock=-1 --ulimit stack=67108864 \
+    $MEM_CAP_FLAG \
     --device /dev/infiniband:/dev/infiniband \
     -e GLOO_SOCKET_IFNAME=$WORKER_IFACE \
     -e NCCL_SOCKET_IFNAME=$WORKER_IFACE \
@@ -988,6 +1032,7 @@ docker run \
     $WORKER_MODELOPT_MOUNT \
     $WORKER_PLE_OFFLOAD_MOUNTS \
     $PLE_PACKED_ENV \
+    $PLE_MULTINODE_ENV \
     $WORKER_OVERLAY_MOUNTS \
     $OVERLAY_ENV_STR \
     $WORKER_HF_MOUNT \
@@ -1033,6 +1078,7 @@ docker run \
     -d --name vllm-fn \
     --gpus all --network host --ipc host \
     --cap-add SYS_NICE --ulimit memlock=-1 --ulimit stack=67108864 \
+    $MEM_CAP_FLAG \
     --device /dev/infiniband:/dev/infiniband \
     -e GLOO_SOCKET_IFNAME=$IFACE \
     -e NCCL_SOCKET_IFNAME=$IFACE \
@@ -1052,6 +1098,7 @@ docker run \
     $HEAD_MODELOPT_MOUNT \
     $HEAD_PLE_OFFLOAD_MOUNTS \
     $PLE_PACKED_ENV \
+    $PLE_MULTINODE_ENV \
     $HEAD_OVERLAY_MOUNTS \
     $OVERLAY_ENV_STR \
     -v $HF_CACHE_DIR:/root/.cache/huggingface \
@@ -1072,6 +1119,23 @@ LAUNCH_EOF
 
     info "  (starting head container...)"
     bash "$HEAD_SCRIPT"
+    ok "Head container started."
+
+
+    # ---- Memory watchdog (both nodes) ----
+    # Unified memory: an exhausted pool HANGS the kernel instead of OOM-killing,
+    # and gx10a has no swap. Second line of defence behind the cgroup cap; kills
+    # the container if host MemAvailable drops below the floor.
+    if [[ "$MEMWATCH_MIN_GIB" -gt 0 ]]; then
+        mkdir -p "$SCRIPT_DIR/logs"
+        pkill -f "memwatch.sh vllm-fn" 2>/dev/null || true
+        nohup bash "$SCRIPT_DIR/files/memwatch.sh" vllm-fn "$MEMWATCH_MIN_GIB" > "$SCRIPT_DIR/logs/memwatch-head.log" 2>&1 &
+        ok "Head watchdog running (kills vllm-fn if MemAvailable < ${MEMWATCH_MIN_GIB} GiB)"
+        if scp -q "$SCRIPT_DIR/files/memwatch.sh" "${WORKER_USER:+${WORKER_USER}@}${WORKER_IP}:/tmp/memwatch.sh"; then
+            ssh_worker "pkill -f memwatch.sh 2>/dev/null; nohup bash /tmp/memwatch.sh vllm-fn $MEMWATCH_MIN_GIB > /tmp/memwatch.log 2>&1 &" >/dev/null 2>&1
+            ok "Worker watchdog running (/tmp/memwatch.log)"
+        fi
+    fi
     rm -f "$HEAD_SCRIPT"
     ok "Head container started."
     info ""
