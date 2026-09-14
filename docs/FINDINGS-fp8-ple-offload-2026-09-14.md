@@ -253,3 +253,12 @@ Two process notes carried over from the run:
   `--model` instead of hardcoding the NVFP4 served name).
 - Remaining before merge-ready: the quality suite, the agentic soak, and the
   nnodes=1 regression listed under "Validation status".
+
+## Credits
+
+- **Tony ([tonyd2wild](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark))** —
+  the EP/chunk experiments in this document were motivated by his per-knob ledger, and the
+  concurrency sweep used for those numbers is built on his `bench_sweep.py` structure. The
+  pair's DS4 deployment (what these Qwen windows swap with) also started as his
+  `ds4-vision-tp2.sh`, adapted to this box.
+- The lane, the offload machinery and `bench/longctx.py` are this repository's (MiaAI-Lab).
