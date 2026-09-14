@@ -1,5 +1,11 @@
 # FP8 PLE offload on 2x DGX Spark — findings (2026-09-14)
 
+> **Co-authored with OpenCode (DeepSeek V4.1 Flash).** The whole FP8 + PLE-offload
+> saga on this lane — the packed-table builder and launcher wiring, the first
+> multi-node boot and the registration-deadlock autopsy, the node-local offload fix,
+> the FP8 packed-table dtype fix, and the boot / sweep / 1M-needle validation — was
+> implemented and driven agentically by OpenCode running DeepSeek V4.1 Flash on the pair.
+
 Working branch: `ple-offload-fp8`. Baseline: FP8 lane, `PLE_OFFLOAD=false`,
 `SKIP_PLE_PATCH=true`, no offload wiring in `start.sh`.
 
