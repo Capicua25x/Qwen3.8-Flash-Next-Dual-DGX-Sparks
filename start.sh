@@ -93,7 +93,7 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"   # fp8 needs files/patch_qsa_fp8_kv.py,
 MAMBA_SSM_CACHE_DTYPE="${MAMBA_SSM_CACHE_DTYPE:-}"
 PLE_OFFLOAD="${PLE_OFFLOAD:-false}"
 # TP2 memory safety (see tp1/start.sh for the same rails at TP1). On unified
-# memory an exhausted pool hangs the kernel instead of OOM-killing, and gx10a
+# memory an exhausted pool hangs the kernel instead of OOM-killing, and the head node
 # has NO swap, so these are load-bearing whenever PLE offload is on.
 #   CONTAINER_MEM_GIB     hard cgroup cap per container (host-side footprint:
 #                         Python procs, pinned buffers, page cache). GPU side is
@@ -1118,7 +1118,7 @@ LAUNCH_EOF
 
     # ---- Memory watchdog (both nodes) ----
     # Unified memory: an exhausted pool HANGS the kernel instead of OOM-killing,
-    # and gx10a has no swap. Second line of defence behind the cgroup cap; kills
+    # and the head node has no swap. Second line of defence behind the cgroup cap; kills
     # the container if host MemAvailable drops below the floor.
     if [[ "$MEMWATCH_MIN_GIB" -gt 0 ]]; then
         mkdir -p "$SCRIPT_DIR/logs"

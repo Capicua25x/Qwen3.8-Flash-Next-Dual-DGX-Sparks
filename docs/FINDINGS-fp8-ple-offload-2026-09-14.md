@@ -161,9 +161,9 @@ TP2/2 nodes). Results:
 
 - Both nodes spawned their own offload worker and served exactly one local
   registration:
-  - gx10a: `GPU worker 0 registered (dp_rank=0, tp_rank=0)` →
+  - node 0: `GPU worker 0 registered (dp_rank=0, tp_rank=0)` →
     `Registrations complete` → `Busy-loop started`;
-  - gx10b: `GPU worker 1 registered (dp_rank=0, tp_rank=1)` →
+  - node 1: `GPU worker 1 registered (dp_rank=0, tp_rank=1)` →
     `Registrations complete` → `Busy-loop started` (this node never had a
     worker before the fix).
 - Boot reached `:8888` (`qwen3.8-flash-next-fp8`, max_model_len 262144),
