@@ -125,14 +125,14 @@ transport-correct option.
 
 ## Validation status
 
-NOT YET BOOT-VALIDATED — the pair was restored to DS4 (`deepseek-v4-flash`)
-right after this autopsy. Planned checks on the next FP8 window:
+**Boot-validated on hardware (2026-09-14):** node-local registrations on both nodes,
+`:8888` serving, real generations with zero worker errors, and a 1M-context needle run
+(see the "UPDATE — validation boot" and "1M context" sections below). Still **untested**:
 
-- each node logs `Bound IPC address ...; waiting for 1 GPU worker
-  registration(s)` and `Registrations complete`;
-- boot reaches `:8888` with the packed table attached on both nodes;
-- long-context sweep + KV pool size vs the FP8 baseline;
-- single-node regression (nnodes=1) still serves.
+- a **quality** suite — no reasoning/quality evaluation has been run on this lane
+  (`bench/reasoning_check.py`, AA-LCR, and the thinking+tools agentic soak are pending);
+- single-node regression (nnodes=1) — the TP1 lane's own copies are untouched, but the
+  patched TP2 files have not been booted at nnodes=1.
 
 **Safety rails worked:** cgroup cap held at 40.0 GiB; memwatch logged
 `avail=44948MiB ... container=40956MiB` throughout; host MemAvailable stayed
@@ -203,9 +203,47 @@ serves one dp0 replica per node; that config previously died with a bare
   `GPU_MEMORY_UTILIZATION=0.70`, `PLE_OFFLOAD=true` (deliberately
   uncommitted).
 
+## 1M context on the FP8 lane (2026-09-14, evening)
+
+First 1M-context run on this lane: FP8 weights + node-local PLE offload, booted with
+`OVERRIDE_MAX_MODEL_LEN=1000000 OVERRIDE_YARN_ENABLE=true --no-download` (YaRN 4.0,
+GMU 0.70, chunk 8192, EP off). Boot reports `GPU KV cache size: 1,670,658 tokens,
+Maximum concurrency for 1,000,000 tokens per request: 1.67x` — a full 1M request fits.
+
+Needle run with the repo's own `bench/longctx.py` (one prompt, three needles at
+5% / 50% / 95% depth, salted to defeat prefix caching):
+
+| metric | value |
+|---|---|
+| prompt tokens | 937,508 |
+| TTFT (prefill wall) | 672.98 s |
+| prefill speed | 1,393 tok/s |
+| decode speed | 51.9 tok/s |
+| needles | alpha / bravo / charlie — **all FOUND** |
+
+**Scope: retrieval only, not quality.** This is a long-context needle retrieval pass;
+**no quality evaluation has been run on this lane yet** — `bench/reasoning_check.py`,
+AA-LCR and the thinking+tools agentic soak are still pending, and no claim about answer
+quality at 1M should be made from this run.
+
+Context for the numbers: her #41 validated the same depth class on **NVFP4** + YaRN
+(937,525-token cold rung: 328 s ≈ 2,858 tok/s prefill, single needle at ~80% depth).
+This run is three needles at three depths in one prompt, and it is the first
+FP8 + offload 1M result anywhere. FP8 prefill here is ~2x slower (FP8 dense kernels +
+the offload lane's GMU 0.70); decode at depth is healthy.
+
+Two process notes carried over from the run:
+- `max_tokens` under-budgeting looks like a retrieval failure (her #41 finding) — the
+  first attempt used 256 and was restarted at 2048 before drawing any conclusion.
+- Killing a streaming request leaves an engine-side zombie that keeps working (her
+  issue #24, confirmed live): the aborted first attempt still consumed a full 937k
+  prefill. Do not kill streaming tests; let them time out.
+
 ## Status
 
-- Branch `ple-offload-fp8` on gx10a: `24583f3` (topology fix) + `96aa55d`
-  (dtype fix + DP gate). **Not pushed anywhere yet.**
-- PR #54 (draft) to MiaAI-Lab remains as-is pending the operator's go to
-  push the validated commits.
+- Branch `ple-offload-fp8` is pushed to the fork (`Capicua25x`) and tracks draft
+  PR #54 to MiaAI-Lab; discussion thread: issue #55.
+- Newest local commit on top of the pushed head: `5aadc80` (bench tools take
+  `--model` instead of hardcoding the NVFP4 served name).
+- Remaining before merge-ready: the quality suite, the agentic soak, and the
+  nnodes=1 regression listed under "Validation status".
