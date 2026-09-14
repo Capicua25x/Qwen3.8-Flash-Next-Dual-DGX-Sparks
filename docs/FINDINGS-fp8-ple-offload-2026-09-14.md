@@ -143,3 +143,69 @@ right after this autopsy. Planned checks on the next FP8 window:
   (gpu_worker mount lost) — reordered.
 - The packed-table mount was added to the dead `DOCKER_ARGS` path instead of
   the live heredoc mount variables — moved to `HEAD/WORKER_PLE_OFFLOAD_MOUNTS`.
+
+---
+
+## UPDATE — validation boot (2026-09-14, same day)
+
+The fix was booted on the pair (`PLE_OFFLOAD=true`, GPU_MEMORY_UTILIZATION=0.70,
+TP2/2 nodes). Results:
+
+**Topology fix: WORKS.**
+
+- Both nodes spawned their own offload worker and served exactly one local
+  registration:
+  - gx10a: `GPU worker 0 registered (dp_rank=0, tp_rank=0)` →
+    `Registrations complete` → `Busy-loop started`;
+  - gx10b: `GPU worker 1 registered (dp_rank=0, tp_rank=1)` →
+    `Registrations complete` → `Busy-loop started` (this node never had a
+    worker before the fix).
+- Boot reached `:8888` (`qwen3.8-flash-next-fp8`, max_model_len 262144),
+  KV cache 1.58M tokens (6.05x concurrency at 262k).
+
+**First real forward crashed — a second, unrelated bug found and fixed
+(`96aa55d`).** The very first CPU forward on both nodes hit
+`RuntimeError: index_select(): self and result must have the same scalar
+type` in `ple_layer.py::forward_impl`'s packed-table branch: the mmapped
+table is uint8 bytes, while the FP8 output buffer is float8_e4m3fn by design
+(the GPU side bit-views the rows and dequantizes with the retained scale),
+so `index_select(..., out=buffer)` is illegal. NVFP4 buffers are uint8 and
+were unaffected. Fix: keep the zero-copy `out=` for uint8 buffers and
+gather-then-bit-view (`rows.view(output.dtype)`) for float8 buffers. This
+path had never executed anywhere before (previous boots never got past the
+registration deadlock and the TP1 lane ships NVFP4).
+
+**After the fix:** real generations served with zero worker errors on both
+nodes across two requests (57 and 93 completion tokens); single-stream speed
+in line with the ~47 tok/s thinking-on baseline.
+
+**Multi-node DP gate (same commit):** `_validate_ple_offload_config` now
+rejects `nnodes>1 && DP>1` with a clear message (a node-local worker only
+serves one dp0 replica per node; that config previously died with a bare
+`IndexError` in the connector).
+
+## Sweep results (thinking on, EP A/B + chunk A/B; 2 rounds, levels 1 and 6)
+
+| config             | mix c1 agg / TTFT | mix c6 agg / TTFT | long c1 agg / prefill | long c6 agg / TTFT |
+|--------------------|-------------------|-------------------|-----------------------|--------------------|
+| EP-on  chunk 4096  | 33.7 / 4.14 s     | 69.5 / 12.74 s    | 10.9 / 2196 t/s       | 14.8 / 11.39 s     |
+| EP-off chunk 4096  | 36.2 / 4.10 s     | 75.8 / 11.38 s    | 11.8 / 2293 t/s       | 15.4 / 10.99 s     |
+| EP-off chunk 8192  | 35.4 / 3.20 s     | 73.8 / 14.76 s    | 12.6 / 2425 t/s       | 16.6 / 10.70 s     |
+
+- **EP-off is adopted** — it wins every cell (agg +7-9%), contrary to the
+  earlier "−4% at TP2" note.
+- **Chunk 8192 is kept for the long-context lane**: the flatlining long shape
+  improves everywhere (+6-8% agg, TTFT, prefill +5.8%), at the cost of mix c6
+  (−2 agg, +3.4 s TTFT). Tony's +59% prefill claim does not reproduce
+  (+5.8%). Two rounds is thin; re-confirm with a 3-round, 4-level run before
+  treating either chunk choice as final.
+- `.env` now: `ENABLE_EXPERT_PARALLEL=false`, `MAX_NUM_BATCHED_TOKENS=8192`,
+  `GPU_MEMORY_UTILIZATION=0.70`, `PLE_OFFLOAD=true` (deliberately
+  uncommitted).
+
+## Status
+
+- Branch `ple-offload-fp8` on gx10a: `24583f3` (topology fix) + `96aa55d`
+  (dtype fix + DP gate). **Not pushed anywhere yet.**
+- PR #54 (draft) to MiaAI-Lab remains as-is pending the operator's go to
+  push the validated commits.
