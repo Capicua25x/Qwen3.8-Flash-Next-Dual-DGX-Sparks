@@ -49,7 +49,13 @@ EDITS = [
         "            unsupported.append(f\"nnodes={parallel_config.nnodes}\")\n",
         "        # nnodes > 1 is supported: one node-local offload worker per\n"
         "        # node over local CUDA IPC, shared memory and a per-node zmq\n"
-        "        # ipc path. (DP must still be node-local; checked below.)\n",
+        "        # ipc path. Replicas that span every node (DP>1) are NOT:\n"
+        "        # a node-local worker only serves one dp0 replica per node.\n"
+        "        if parallel_config.nnodes > 1 and parallel_config.data_parallel_size > 1:\n"
+        "            unsupported.append(\n"
+        "                f\"nnodes={parallel_config.nnodes} with \"\n"
+        "                f\"DP={parallel_config.data_parallel_size}\"\n"
+        "            )\n",
     ),
     # 2. Spawn from each node's first DP0 rank, not from global rank 0.
     (

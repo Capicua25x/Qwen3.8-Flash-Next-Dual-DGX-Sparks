@@ -215,7 +215,13 @@ class Worker(WorkerBase):
         unsupported = []
         # nnodes > 1 is supported: one node-local offload worker per
         # node over local CUDA IPC, shared memory and a per-node zmq
-        # ipc path. (DP must still be node-local; checked below.)
+        # ipc path. Replicas that span every node (DP>1) are NOT:
+        # a node-local worker only serves one dp0 replica per node.
+        if parallel_config.nnodes > 1 and parallel_config.data_parallel_size > 1:
+            unsupported.append(
+                f"nnodes={parallel_config.nnodes} with "
+                f"DP={parallel_config.data_parallel_size}"
+            )
         if parallel_config.data_parallel_backend != "mp":
             unsupported.append(f"DP backend={parallel_config.data_parallel_backend}")
         if (
