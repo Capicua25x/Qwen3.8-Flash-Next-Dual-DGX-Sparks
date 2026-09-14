@@ -213,16 +213,9 @@ class Worker(WorkerBase):
         """Reject unsupported PLE offload execution modes."""
         parallel_config = self.parallel_config
         unsupported = []
-        # --- APEXiA 2026-09-14: opt-in multi-node escape hatch ---
-        # The offload path is node-local (each GPU worker spawns its own
-        # offload process; per-node zmq ipc addr; local file_system shm), so
-        # nnodes>1 means N independent node-local offload workers, not a
-        # cross-node coordination requirement. Gated on an explicit env flag
-        # so the upstream default is unchanged.
-        if parallel_config.nnodes != 1 and os.environ.get(
-            "VLLM_PLE_OFFLOAD_ALLOW_MULTINODE", "0"
-        ) != "1":
-            unsupported.append(f"nnodes={parallel_config.nnodes}")
+        # nnodes > 1 is supported: one node-local offload worker per
+        # node over local CUDA IPC, shared memory and a per-node zmq
+        # ipc path. (DP must still be node-local; checked below.)
         if parallel_config.data_parallel_backend != "mp":
             unsupported.append(f"DP backend={parallel_config.data_parallel_backend}")
         if (
@@ -259,11 +252,17 @@ class Worker(WorkerBase):
             )
 
     def spawn_ple_offload(self) -> None:
-        """Spawn one node-local PLE CPU worker from DP0/TP0."""
+        """Spawn one node-local PLE CPU worker from each node's first
+        DP0 rank."""
+        parallel_config = self.parallel_config
+        node_start = (
+            parallel_config.node_rank_within_dp
+            * parallel_config.local_world_size
+        )
         if (
             not self._ple_offload_enabled
-            or self.rank != 0
-            or self.parallel_config.data_parallel_rank != 0
+            or self.rank != node_start
+            or parallel_config.data_parallel_rank != 0
         ):
             return
 
@@ -274,7 +273,8 @@ class Worker(WorkerBase):
             raise RuntimeError("PLE offload IPC address was not initialized")
         dp_size = self.parallel_config.data_parallel_size
         tp_size = self.parallel_config.tensor_parallel_size
-        num_workers = dp_size * tp_size
+        # One worker per node: it only receives its own node's ranks.
+        num_workers = self.parallel_config.local_world_size
         logger.info(
             "PleOffload: spawning worker "
             "(rank=%d, local_rank=%d, dp_size=%d, tp_size=%d, "

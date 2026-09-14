@@ -1,7 +1,7 @@
 # FP8 PLE offload on 2x DGX Spark — findings (2026-09-14)
 
-Working branch: `ple-offload-fp8` (commit cccd2ff). Baseline: FP8 lane,
-`PLE_OFFLOAD=false`, `SKIP_PLE_PATCH=true`, no offload wiring in `start.sh`.
+Working branch: `ple-offload-fp8`. Baseline: FP8 lane, `PLE_OFFLOAD=false`,
+`SKIP_PLE_PATCH=true`, no offload wiring in `start.sh`.
 
 ## What we built
 
@@ -25,7 +25,7 @@ output dtype is implemented in `worker.py::get_offload_output_dtype`, and
 all of it properly, including a cgroup cap + `memwatch.sh` watchdog, because
 PLE_OFFLOAD is mandatory there.
 
-## The blocker
+## First blocker
 
 `vllm/v1/worker/gpu_worker.py::_validate_ple_offload_config` rejects
 `parallel_config.nnodes != 1`:
@@ -36,121 +36,109 @@ PLE_OFFLOAD is mandatory there.
 It is the ONLY failing check for our TP2 config (DP=mp, PP=1, PCP=1, DCP=1,
 no ubatching, architecture allowed, no weight transfer).
 
-## Why the guard is too strict for this architecture
+## First multi-node boot: the FP8 format works
 
-The offload path is node-local by construction:
-- each GPU worker spawns its own offload process (`spawn_ple_offload`, a local
-  `multiprocessing.Process`, not a distributed process group);
-- coordination is zmq over `parallel_config._ple_offload_ipc_path`, a per-node
-  local address;
-- shared memory uses `torch_mp.set_sharing_strategy("file_system")` (local shm).
+With the guard lifted (`VLLM_PLE_OFFLOAD_ALLOW_MULTINODE=1`, commit `ee12cb8`)
+the pair booted past it. Proven working:
 
-The only `world_size` use is an identity scalar (`worker_id = dp_rank *
-world_size + rank`). At nnodes=2 there are two independent node-local offload
-workers, each mmapping its own local copy of the packed table — which is
-exactly why the table must exist on both nodes.
-
-## Why TP1 cannot be used to isolate the test
-
-FP8 weights are 1 byte/param: 172.8 GiB on disk, of which 47.68 GiB is the PLE
-table -> ~125.1 GiB of non-PLE weight. One Spark is a ~121.7 GiB unified pool
-with ~5.6 GiB runtime overhead, so full FP8 does not fit at TP1 (this is the
-same reason the TP1 lane ships the smaller NVFP4 checkpoint). TP2 (~62.5 GiB
-of weight per node) is the only configuration where FP8 fits — so the nnodes
-guard must be patched; there is no single-node isolation path.
-
-## Next step
-
-Overlay `gpu_worker.py` (same patch mechanism as `patch_ple_offload.py`) to
-allow `nnodes>1` for the node-local offload design, relaunch TP2, and compare
-the long-context sweep (the shape that flatlines: 11.1 tok/s c1, TTFT climbing
-linearly to 11.3 s at c6) plus the KV pool size.
-
----
-
-## UPDATE — first multi-node boot (2026-09-14, later)
-
-The nnodes guard was patched (one hunk, `VLLM_PLE_OFFLOAD_ALLOW_MULTINODE=1`)
-and the pair booted past it. Results:
-
-**Proven working:**
 - FP8 packed table built (47.68 GiB, byte-exact) and visible in both containers.
 - The offload worker logs, verbatim:
-  `PLE ...: using packed mmap table /var/tmp/qwen38-ple-packed/...packed_u8`
-  `PLE ...: mmap table attached (320001536 rows x 160 B = 47.68 GiB)`
-  `PLE weight loading complete.`
-  `PleOffload: registered 1 PleOffloadLayer(s) (dp_rank=0, tp_rank=0, ipc_addr=ipc:///tmp/...)`
-- So the FP8 packed format, the mmap attach and the FP8 output dtype are all
-  correct — the new builder works.
 
-**New blocker — the real reason the nnodes guard exists.**
-Both nodes registered, but to DIFFERENT ipc addresses (each node spawns its own
-offload worker with its own `ipc:///tmp/<uuid>`):
-  gx10a tp_rank=0 -> ipc:///tmp/be137422-...
-  gx10b tp_rank=1 -> ipc:///tmp/9abeecbb-...
-Then:
-  TimeoutError: PLE offload worker did not become ready within 600.0s
+      PLE ...: using packed mmap table /var/tmp/qwen38-ple-packed/...packed_u8
+      PLE ...: mmap table attached (320001536 rows x 160 B = 47.68 GiB)
+      PLE weight loading complete.
+      PleOffload: registered 1 PleOffloadLayer(s) (dp_rank=0, tp_rank=0, ipc_addr=ipc:///tmp/...)
 
-`PleOffloadWorker.accept_registrations` expects `num_workers = dp_size *
-tp_size` (=2 at TP2) registrations in a SINGLE worker process. Each nodes
+So the FP8 packed format, the mmap attach and the FP8 output dtype are all
+correct — the new builder works.
 
----
+## The real blocker (corrected): the worker is node-local by design, the code around it is not
 
-## UPDATE — first multi-node boot (2026-09-14, later)
+The first boot's failure was read as "two node-local workers, each waiting for
+2 registrations". Reading `spawn_ple_offload`, `multiproc_executor.py` and
+`accept_registrations` together shows something simpler: only ONE offload
+worker ever existed.
 
-The nnodes guard was patched (one hunk, `VLLM_PLE_OFFLOAD_ALLOW_MULTINODE=1`)
-and the pair booted past it. Results:
+- `spawn_ple_offload` spawns on GLOBAL rank 0 only (`self.rank != 0`).
+- `multiproc_executor.py` gives node 1's only rank global rank 1
+  (`global_start_rank = local_world_size * node_rank_within_dp`), so node 1
+  never spawned a worker.
+- `parallel_config._ple_offload_ipc_path` is generated per config
+  (`get_open_zmq_ipc_path()` -> `ipc://<base>/<uuid4()>`), so node 1's
+  connector connected to a path with no listener. A zmq PUSH `connect()` to a
+  missing ipc path succeeds; the registration queues in the socket and is
+  dropped at close (`linger=0`) with no error. The `PleOffload: registered
+  ...` lines on both nodes are the CONNECTORS logging — they are not proof of
+  two workers, and the two different ipc addresses are the two configs' paths,
+  not two bound sockets.
+- The one worker (node 0) waited for `num_workers = dp_size * tp_size = 2`
+  registrations, received only rank 0's, and timed out:
 
-**Proven working:**
-- FP8 packed table built (47.68 GiB, byte-exact) and visible in both containers.
-- The offload worker logs, verbatim:
-  - `PLE ...: using packed mmap table /var/tmp/qwen38-ple-packed/...packed_u8`
-  - `PLE ...: mmap table attached (320001536 rows x 160 B = 47.68 GiB)`
-  - `PLE weight loading complete.`
-  - `PleOffload: registered 1 PleOffloadLayer(s) (dp_rank=0, tp_rank=0, ipc_addr=ipc:///tmp/...)`
-- So the FP8 packed format, the mmap attach and the FP8 output dtype are all
-  correct — the new builder works.
+      TimeoutError: PLE offload worker did not become ready within 600.0s
 
-**New blocker — the real reason the nnodes guard exists.**
-Both nodes registered, but to DIFFERENT ipc addresses (each node spawns its own
-offload worker with its own `ipc:///tmp/<uuid>`):
+So the guard does encode a real invariant, but the invariant is finer than
+"single node": the whole protocol assumes ONE process tree — a single worker
+for all ranks, spawned from global rank 0, counted world-wide, with a single
+request sender per DP group. Multi-node needs the per-node worker topology
+that the worker-side docstrings already describe ("serve every local DP rank",
+"one CPU offload process for all local DP and TP workers") but that the
+spawn/accounting/request paths never implemented.
 
-    gx10a tp_rank=0 -> ipc:///tmp/be137422-...
-    gx10b tp_rank=1 -> ipc:///tmp/9abeecbb-...
+Three gaps, not one:
 
-Then:
+1. **spawn** — global rank 0 (`self.rank != 0`) instead of each node's first
+   rank;
+2. **accounting** — `num_workers = dp_size * tp_size` (world) and validation
+   against global TP rank sets, instead of the node's local rank count and
+   local rank sets;
+3. **requests/inputs** — `_launch` sends only from `tp_rank == 0`, and
+   `_pin_input_buffers` only runs there. On a second node the local rank would
+   wait forever on a done flag nobody could set, and its worker would never
+   receive a request — gaps 1+2 alone still deadlock.
 
-    TimeoutError: PLE offload worker did not become ready within 600.0s
+## The fix on this branch
 
-`PleOffloadWorker.accept_registrations` expects `num_workers = dp_size *
-tp_size` (=2 at TP2) registrations in a SINGLE worker process. Each node's
-worker therefore waits for 2 registrations but only ever receives its own
-node's (1). Two workers, each waiting for two, each getting one -> deadlock.
+One offload worker per node, serving that node's local ranks:
 
-So the guard is NOT merely conservative: it encodes the invariant that ONE
-offload worker serves all TP ranks, which holds only when they share a process
-tree (single node). The earlier "node-local, therefore safe" reading was right
-about the mechanism but wrong about the accounting — the worker counts
-registrations globally.
+- `spawn_ple_offload` spawns from each node's first DP0 rank
+  (`rank == node_rank_within_dp * local_world_size`);
+- `num_workers = local_world_size`;
+- every registration carries its global `rank`; the worker validates that the
+  received rank set equals the node's local rank range, rejects duplicate
+  `(dp_rank, tp_rank)` slots, and picks the lowest-rank local member of each DP
+  group as the input/request leader;
+- the connector computes `is_local_leader` (lowest local rank of its DP group)
+  and only the leader pins/stages input buffers and sends
+  `PleOffloadRequest`. Every rank still blocks on its own done flag; inputs are
+  TP-replicated, so the local copy is equivalent.
 
-**What a real multi-node fix needs** (pick one):
-1. Per-node offload workers, each with `num_workers = 1` (the local TP rank),
-   and the registration/target bookkeeping keyed by local rank. This is the
-   node-local design the architecture already implies — the largest but most
-   correct change.
-2. A cross-node rendezvous so one worker serves both ranks over the fabric
-   (what the guard/design assumes) — much harder: IPC output buffers are CUDA
-   IPC handles and the request path is a local zmq PUSH, neither of which
-   crosses nodes today.
+Single-node behaviour is unchanged: the leader is TP0 of each DP group and
+`local_world_size == dp_size * tp_size`, so the registration set, the leader
+and the request sender are exactly what they were.
 
-Option 1 matches what each node already does (spawn local worker, mmap local
-table) and is the recommended path.
+The alternative — one worker serving both nodes over the fabric — is not
+available today: CUDA IPC output buffers and file_system shared memory never
+cross nodes, so it would need a different transport for both. Per-node
+workers duplicate the CPU forward once per node (the table is already mmapped
+locally on both); that is cheap next to the GPU forward and is the only
+transport-correct option.
+
+## Validation status
+
+NOT YET BOOT-VALIDATED — the pair was restored to DS4 (`deepseek-v4-flash`)
+right after this autopsy. Planned checks on the next FP8 window:
+
+- each node logs `Bound IPC address ...; waiting for 1 GPU worker
+  registration(s)` and `Registrations complete`;
+- boot reaches `:8888` with the packed table attached on both nodes;
+- long-context sweep + KV pool size vs the FP8 baseline;
+- single-node regression (nnodes=1) still serves.
 
 **Safety rails worked:** cgroup cap held at 40.0 GiB; memwatch logged
 `avail=44948MiB ... container=40956MiB` throughout; host MemAvailable stayed
 ~44 GiB. No host hang.
 
-**Also fixed during this session (launcher bugs, committed):**
+**Also fixed during the first boot (committed):**
 - `HEAD_PLE_OFFLOAD_MOUNTS` was clobbered by a later `=` after the `+=`
   (gpu_worker mount lost) — reordered.
 - The packed-table mount was added to the dead `DOCKER_ARGS` path instead of

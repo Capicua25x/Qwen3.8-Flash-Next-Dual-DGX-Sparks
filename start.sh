@@ -711,7 +711,6 @@ if $DO_LAUNCH; then
     HEAD_PLE_OFFLOAD_MOUNTS=""
     WORKER_PLE_OFFLOAD_MOUNTS=""
     PLE_PACKED_ENV=""
-    PLE_MULTINODE_ENV=""
     if [[ "$PLE_OFFLOAD" == "true" ]]; then
         info "=== Step 6c: PLE CPU-offload wiring ==="
 
@@ -739,25 +738,24 @@ if $DO_LAUNCH; then
             WORKER_PLE_OFFLOAD_MOUNTS+=" -v /tmp/ple_offload_$_f.py:$_dst:ro"
         done
 
-        # Multi-node escape hatch: the stock guard rejects nnodes>1, but the
-        # offload path is node-local (each GPU worker spawns its own offload
-        # process; per-node zmq ipc; local file_system shm). Minimal one-hunk
-        # patch, opt-in via VLLM_PLE_OFFLOAD_ALLOW_MULTINODE=1.
-        if [[ "$TENSOR_PARALLEL_SIZE" -gt 1 ]] || [[ "$PLE_ALLOW_MULTINODE" == "true" ]]; then
-            if [[ ! -f "$SCRIPT_DIR/files/gpu_worker/gpu_worker.py.orig" ]]; then
-                info "Extracting gpu_worker.py from image..."
-                _c=$(docker create "$IMAGE" /bin/true)
-                docker cp "$_c:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py" "$SCRIPT_DIR/files/gpu_worker/gpu_worker.py.orig"
-                docker rm "$_c" >/dev/null 2>&1
-            fi
-            python3 "$SCRIPT_DIR/files/patch_gpu_worker_ple_nnodes.py" >/dev/null || err "patch_gpu_worker_ple_nnodes.py failed"
-            _GW="$VLLM_PKG/v1/worker/gpu_worker.py"
-            HEAD_PLE_OFFLOAD_MOUNTS+=" -v $SCRIPT_DIR/files/gpu_worker/gpu_worker.py:$_GW:ro"
-            scp -q "$SCRIPT_DIR/files/gpu_worker/gpu_worker.py" "${WORKER_USER:+${WORKER_USER}@}${WORKER_IP}:/tmp/ple_offload_gpu_worker.py"
-            WORKER_PLE_OFFLOAD_MOUNTS+=" -v /tmp/ple_offload_gpu_worker.py:$_GW:ro"
-            PLE_MULTINODE_ENV="-e VLLM_PLE_OFFLOAD_ALLOW_MULTINODE=1"
-            ok "PLE offload multinode guard patch applied (TP=$TENSOR_PARALLEL_SIZE)"
+        # Node-local multi-node support: one offload worker per node, spawned
+        # from each node's first rank, seeing only that node's registrations.
+        # Stock vLLM rejects nnodes>1 and spawns from global rank 0 only, so
+        # the guard, the spawn condition and the registration count are
+        # patched here (the worker/connector/registration side lives in
+        # files/patch_ple_offload.py).
+        if [[ ! -f "$SCRIPT_DIR/files/gpu_worker/gpu_worker.py.orig" ]]; then
+            info "Extracting gpu_worker.py from image..."
+            _c=$(docker create "$IMAGE" /bin/true)
+            docker cp "$_c:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py" "$SCRIPT_DIR/files/gpu_worker/gpu_worker.py.orig"
+            docker rm "$_c" >/dev/null 2>&1
         fi
+        python3 "$SCRIPT_DIR/files/patch_gpu_worker_ple_nnodes.py" >/dev/null || err "patch_gpu_worker_ple_nnodes.py failed"
+        _GW="$VLLM_PKG/v1/worker/gpu_worker.py"
+        HEAD_PLE_OFFLOAD_MOUNTS+=" -v $SCRIPT_DIR/files/gpu_worker/gpu_worker.py:$_GW:ro"
+        scp -q "$SCRIPT_DIR/files/gpu_worker/gpu_worker.py" "${WORKER_USER:+${WORKER_USER}@}${WORKER_IP}:/tmp/ple_offload_gpu_worker.py"
+        WORKER_PLE_OFFLOAD_MOUNTS+=" -v /tmp/ple_offload_gpu_worker.py:$_GW:ro"
+        ok "PLE offload gpu_worker patch applied (node-local workers)"
 
         # Locate the packed table for this checkpoint's PLE dtype. The
         # table must exist on BOTH nodes: each GPU worker spawns its own
@@ -904,9 +902,6 @@ print(json.dumps({"text_config": tc}, separators=(",", ":")) if tc else "")
     if [[ -n "$PLE_PACKED_ENV" ]]; then
         DOCKER_ARGS+=("$PLE_PACKED_ENV")
     fi
-    if [[ -n "$PLE_MULTINODE_ENV" ]]; then
-        DOCKER_ARGS+=("$PLE_MULTINODE_ENV")
-    fi
     DOCKER_ARGS+=("-e HF_HOME=/root/.cache/huggingface")
     DOCKER_ARGS+=("-v $HF_CACHE_DIR:/root/.cache/huggingface")
     DOCKER_ARGS+=("-v $HOME/.cache/vllm:/root/.cache/vllm")
@@ -1033,7 +1028,6 @@ docker run \
     $WORKER_MODELOPT_MOUNT \
     $WORKER_PLE_OFFLOAD_MOUNTS \
     $PLE_PACKED_ENV \
-    $PLE_MULTINODE_ENV \
     $WORKER_OVERLAY_MOUNTS \
     $OVERLAY_ENV_STR \
     $WORKER_HF_MOUNT \
@@ -1099,7 +1093,6 @@ docker run \
     $HEAD_MODELOPT_MOUNT \
     $HEAD_PLE_OFFLOAD_MOUNTS \
     $PLE_PACKED_ENV \
-    $PLE_MULTINODE_ENV \
     $HEAD_OVERLAY_MOUNTS \
     $OVERLAY_ENV_STR \
     -v $HF_CACHE_DIR:/root/.cache/huggingface \

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Allow VLLM_PLE_CPU_OFFLOAD with nnodes>1 (multi-node TP).
+"""Make PLE CPU-offload work with multi-node TP (one worker per node).
 
 Why this exists
 ---------------
@@ -9,29 +9,29 @@ PLE CPU-offload config with `parallel_config.nnodes != 1`:
     ValueError: VLLM_PLE_CPU_OFFLOAD does not support the requested
     configuration. Unsupported settings: nnodes=2
 
-That blanket rejection is conservative, not structural. The offload path is
-node-local by construction:
+The offload path is node-local by construction: every registration carries
+CUDA IPC handles (output buffers) and file_system shared-memory tensor views
+(inputs, done flag), and coordination is a per-node ipc address. The correct
+topology for nnodes>1 is therefore ONE offload worker per node serving that
+node's local ranks -- not a cross-node service. The two-node FP8 lane needs
+exactly that: ~125.1 GiB of non-PLE FP8 weight does not fit one Spark
+(~121.7 GiB unified pool), so TP2 is the only shape where full FP8 fits.
 
-  * each GPU worker spawns its OWN offload process
-    (`gpu_worker.py::spawn_ple_offload` -> a local multiprocessing.Process,
-    not a distributed process group);
-  * coordination is zmq over `parallel_config._ple_offload_ipc_path`, a
-    per-node local address;
-  * shared memory uses torch_mp sharing strategy "file_system" (local shm).
+The stock single-node assumption shows up in three places, all fixed here:
 
-The only use of `world_size` in the connector is an identity scalar
-(`worker_id = dp_rank * world_size + rank`). At nnodes=2 there are simply two
-independent, node-local offload workers, each mmapping its own local copy of
-the pre-packed table (which is why the table must exist on both nodes).
+  1. the `nnodes != 1` rejection -- removed;
+  2. `spawn_ple_offload` only spawns on global rank 0, so a second node never
+     gets a worker and its registration is sent to an ipc path with no
+     listener (zmq queues it silently, the message is never delivered) --
+     each node's first rank now spawns
+     (`rank == node_rank_within_dp * local_world_size`);
+  3. `num_workers = dp_size * tp_size` counts the whole world, but a
+     node-local worker only ever receives its own node's registrations --
+     now `local_world_size`.
 
-This is what makes FP8 viable on 2x DGX Spark at all: FP8 weights are
-1 byte/param (~125.1 GiB of non-PLE weight), which does not fit one Spark
-(~121.7 GiB unified pool), so TP2 is the only configuration in which full FP8
-fits -- and it needs the offload to keep the 47.7 GiB PLE table out of UVM.
-
-The edit is deliberately minimal: the nnodes condition is AND-ed with an env
-escape hatch (VLLM_PLE_OFFLOAD_ALLOW_MULTINODE=1). Default behaviour is
-unchanged; every other check in the guard stays exactly as upstream.
+The matching worker/connector/registration changes (per-registration rank,
+local rank-set validation, per-DP-group leader for inputs and requests) live
+in `files/patch_ple_offload.py`.
 
 Inputs:  files/gpu_worker/gpu_worker.py.orig (extracted from the image)
 Outputs: files/gpu_worker/gpu_worker.py      (bind-mounted over the package)
@@ -42,26 +42,59 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ORIG = os.path.join(HERE, "gpu_worker", "gpu_worker.py.orig")
 OUT = os.path.join(HERE, "gpu_worker", "gpu_worker.py")
 
-OLD = """        if parallel_config.nnodes != 1:
-            unsupported.append(f"nnodes={parallel_config.nnodes}")"""
-
-NEW = """        # --- APEXiA 2026-09-14: opt-in multi-node escape hatch ---
-        # The offload path is node-local (each GPU worker spawns its own
-        # offload process; per-node zmq ipc addr; local file_system shm), so
-        # nnodes>1 means N independent node-local offload workers, not a
-        # cross-node coordination requirement. Gated on an explicit env flag
-        # so the upstream default is unchanged.
-        if parallel_config.nnodes != 1 and os.environ.get(
-            "VLLM_PLE_OFFLOAD_ALLOW_MULTINODE", "0"
-        ) != "1":
-            unsupported.append(f"nnodes={parallel_config.nnodes}")"""
+EDITS = [
+    # 1. Accept nnodes>1 for the node-local design.
+    (
+        "        if parallel_config.nnodes != 1:\n"
+        "            unsupported.append(f\"nnodes={parallel_config.nnodes}\")\n",
+        "        # nnodes > 1 is supported: one node-local offload worker per\n"
+        "        # node over local CUDA IPC, shared memory and a per-node zmq\n"
+        "        # ipc path. (DP must still be node-local; checked below.)\n",
+    ),
+    # 2. Spawn from each node's first DP0 rank, not from global rank 0.
+    (
+        '        """Spawn one node-local PLE CPU worker from DP0/TP0."""\n',
+        "        \"\"\"Spawn one node-local PLE CPU worker from each node's first\n"
+        "        DP0 rank.\"\"\"\n",
+    ),
+    (
+        "        if (\n"
+        "            not self._ple_offload_enabled\n"
+        "            or self.rank != 0\n"
+        "            or self.parallel_config.data_parallel_rank != 0\n"
+        "        ):\n"
+        "            return\n",
+        "        parallel_config = self.parallel_config\n"
+        "        node_start = (\n"
+        "            parallel_config.node_rank_within_dp\n"
+        "            * parallel_config.local_world_size\n"
+        "        )\n"
+        "        if (\n"
+        "            not self._ple_offload_enabled\n"
+        "            or self.rank != node_start\n"
+        "            or parallel_config.data_parallel_rank != 0\n"
+        "        ):\n"
+        "            return\n",
+    ),
+    # 3. A node's worker only ever receives that node's registrations.
+    (
+        "        dp_size = self.parallel_config.data_parallel_size\n"
+        "        tp_size = self.parallel_config.tensor_parallel_size\n"
+        "        num_workers = dp_size * tp_size\n",
+        "        dp_size = self.parallel_config.data_parallel_size\n"
+        "        tp_size = self.parallel_config.tensor_parallel_size\n"
+        "        # One worker per node: it only receives its own node's ranks.\n"
+        "        num_workers = self.parallel_config.local_world_size\n",
+    ),
+]
 
 src = open(ORIG).read()
-count = src.count(OLD)
-if count != 1:
-    raise SystemExit(f"gpu_worker.py: anchor not unique/missing (count={count})")
-if "\nimport os\n" not in src and not src.startswith("import os\n"):
-    raise SystemExit("gpu_worker.py: no top-level `import os` -- adjust the patch")
-src = src.replace(OLD, NEW, 1)
+for old, new in EDITS:
+    count = src.count(old)
+    if count != 1:
+        raise SystemExit(
+            f"gpu_worker.py: anchor not unique/missing (count={count}):\n{old[:300]}"
+        )
+    src = src.replace(old, new, 1)
 open(OUT, "w").write(src)
 print("patched gpu_worker.py")
