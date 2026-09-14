@@ -726,6 +726,19 @@ if $DO_LAUNCH; then
         fi
         python3 "$SCRIPT_DIR/files/patch_ple_offload.py" >/dev/null || err "patch_ple_offload.py failed"
 
+
+        PLE_OFFLOAD_PKG="$VLLM_PKG/v1/ple_offload"
+        PLE_LAYER_PKG="$VLLM_PKG/model_executor/layers/ple_offload_layer.py"
+        HEAD_PLE_OFFLOAD_MOUNTS="-v $SCRIPT_DIR/files/ple_offload/connector.py:$PLE_OFFLOAD_PKG/connector.py:ro -v $SCRIPT_DIR/files/ple_offload/protocol.py:$PLE_OFFLOAD_PKG/protocol.py:ro -v $SCRIPT_DIR/files/ple_offload/worker.py:$PLE_OFFLOAD_PKG/worker.py:ro -v $SCRIPT_DIR/files/ple_offload/ple_offload_layer.py:$PLE_LAYER_PKG:ro"
+        # The worker copies land in a flat /tmp dir (same convention as the overlays).
+        for _f in connector protocol worker ple_offload_layer; do
+            _src="$SCRIPT_DIR/files/ple_offload/$_f.py"
+            _dst="$PLE_OFFLOAD_PKG/$_f.py"
+            [[ "$_f" == "ple_offload_layer" ]] && _dst="$PLE_LAYER_PKG"
+            scp -q "$_src" "${WORKER_USER:+${WORKER_USER}@}${WORKER_IP}:/tmp/ple_offload_$_f.py"
+            WORKER_PLE_OFFLOAD_MOUNTS+=" -v /tmp/ple_offload_$_f.py:$_dst:ro"
+        done
+
         # Multi-node escape hatch: the stock guard rejects nnodes>1, but the
         # offload path is node-local (each GPU worker spawns its own offload
         # process; per-node zmq ipc; local file_system shm). Minimal one-hunk
@@ -746,18 +759,6 @@ if $DO_LAUNCH; then
             ok "PLE offload multinode guard patch applied (TP=$TENSOR_PARALLEL_SIZE)"
         fi
 
-        PLE_OFFLOAD_PKG="$VLLM_PKG/v1/ple_offload"
-        PLE_LAYER_PKG="$VLLM_PKG/model_executor/layers/ple_offload_layer.py"
-        HEAD_PLE_OFFLOAD_MOUNTS="-v $SCRIPT_DIR/files/ple_offload/connector.py:$PLE_OFFLOAD_PKG/connector.py:ro -v $SCRIPT_DIR/files/ple_offload/protocol.py:$PLE_OFFLOAD_PKG/protocol.py:ro -v $SCRIPT_DIR/files/ple_offload/worker.py:$PLE_OFFLOAD_PKG/worker.py:ro -v $SCRIPT_DIR/files/ple_offload/ple_offload_layer.py:$PLE_LAYER_PKG:ro"
-        # The worker copies land in a flat /tmp dir (same convention as the overlays).
-        for _f in connector protocol worker ple_offload_layer; do
-            _src="$SCRIPT_DIR/files/ple_offload/$_f.py"
-            _dst="$PLE_OFFLOAD_PKG/$_f.py"
-            [[ "$_f" == "ple_offload_layer" ]] && _dst="$PLE_LAYER_PKG"
-            scp -q "$_src" "${WORKER_USER:+${WORKER_USER}@}${WORKER_IP}:/tmp/ple_offload_$_f.py"
-            WORKER_PLE_OFFLOAD_MOUNTS+=" -v /tmp/ple_offload_$_f.py:$_dst:ro"
-        done
-
         # Locate the packed table for this checkpoint's PLE dtype. The
         # table must exist on BOTH nodes: each GPU worker spawns its own
         # offload process, and that process mmaps the table locally.
@@ -771,6 +772,7 @@ if $DO_LAUNCH; then
                 rsync -a "$PLE_PACKED_TABLE_DIR/" "${WORKER_USER:+${WORKER_USER}@}${WORKER_IP}:$PLE_PACKED_TABLE_DIR/" || err "rsync of PLE packed table to worker failed"
             fi
             WORKER_PLE_OFFLOAD_MOUNTS+=" -v $PLE_PACKED_TABLE_DIR:$PLE_PACKED_TABLE_DIR:ro"
+            HEAD_PLE_OFFLOAD_MOUNTS+=" -v $PLE_PACKED_TABLE_DIR:$PLE_PACKED_TABLE_DIR:ro"
             PLE_PACKED_ENV="-e VLLM_PLE_PACKED_TABLE_DIR=$PLE_PACKED_TABLE_DIR"
             ok "PLE packed table dir: $PLE_PACKED_TABLE_DIR (synced to worker)"
         else
@@ -901,7 +903,6 @@ print(json.dumps({"text_config": tc}, separators=(",", ":")) if tc else "")
     fi
     if [[ -n "$PLE_PACKED_ENV" ]]; then
         DOCKER_ARGS+=("$PLE_PACKED_ENV")
-        DOCKER_ARGS+=("-v" "$PLE_PACKED_TABLE_DIR:$PLE_PACKED_TABLE_DIR:ro")
     fi
     if [[ -n "$PLE_MULTINODE_ENV" ]]; then
         DOCKER_ARGS+=("$PLE_MULTINODE_ENV")
