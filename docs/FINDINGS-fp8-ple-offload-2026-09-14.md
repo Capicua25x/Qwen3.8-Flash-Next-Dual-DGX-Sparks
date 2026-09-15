@@ -133,12 +133,12 @@ transport-correct option.
 
 **Boot-validated on hardware (2026-09-14):** node-local registrations on both nodes,
 `:8888` serving, real generations with zero worker errors, and a 1M-context needle run
-(see the "UPDATE — validation boot" and "1M context" sections below). Still **untested**:
+(see the "UPDATE — validation boot" and "1M context" sections below). Still **open**:
 
-- a **quality** suite — no reasoning/quality evaluation has been run on this lane
-  (`bench/reasoning_check.py`, AA-LCR, and the thinking+tools agentic soak are pending);
-- single-node regression (nnodes=1) — the TP1 lane's own copies are untouched, but the
-  patched TP2 files have not been booted at nnodes=1.
+- single-node regression (nnodes=1) — the TP1 lane's own copies are untouched and the
+  single-node path is analytically unchanged (leader = TP0 of each DP group,
+  `local_world_size == dp*tp`); not booted because the full FP8 checkpoint does not fit
+  one device.
 
 **Safety rails worked:** cgroup cap held at 40.0 GiB; memwatch logged
 `avail=44948MiB ... container=40956MiB` throughout; host MemAvailable stayed
@@ -316,6 +316,49 @@ Tony's per-step gather (and to the compile-off pairing that profile requires), n
 demand paging as such. A deeper cold probe (500k+) was not run; at 1M the working set
 grows, and that is the remaining open measurement.
 
+## Depth reasoning, ≥95%-depth needles under load, and the thinking+tools soak (2026-09-15)
+
+Three follow-ups, all on the same lane (FP8 weights, node-local PLE offload, 1M/YaRN,
+EP off, chunk 8192, GMU 0.70).
+
+**Needles at 95% depth *under load*.** `bench/lc_load.py` gained a `--depth` argument (the
+first version pinned the needle at 50% depth). Needles at **95% depth**:
+
+| stage | shape | result |
+|---|---|---|
+| 1 | 6 concurrent x ~230k tokens (1.38M total) | **6/6 found** — TTFT 108 / 211 / 314 / 417 / 520 / 620 s (capacity-queued: ~2 running, up to 4 waiting); wall 622 s |
+| 2 | single x ~989k tokens | **found** — TTFT 665.7 s, wall 667.7 s |
+
+0 errors: retrieval holds at 95% depth with the lane at capacity, not only in a quiet
+single stream.
+
+**Depth reasoning — AA-LCR.** The long-context reasoning benchmark (ArtificialAnalysis),
+run with an on-spec thinking protocol (temperature 1.0 / top_p 0.95 / top_k 20, seed 1234,
+30k generation cap) and judged by an independent model (`gpt-5.6-sol`):
+
+| cell | n | score |
+|---|---|---|
+| AA-LCR, 1M/YaRN, thinking on, seed 1234 | 100 | **0.81** |
+
+This is the first AA-LCR run on this checkpoint (the README still owes a quality
+re-evaluation). It is well clear of the retrieval floor: the answers are reasoned at
+~100k-average document depth, not pattern-matched from a buried line.
+
+**Long agentic thinking+tools soak (the sglang#36537 token-0 loop).** Two runs with
+thinking ON and OpenAI tools enabled (`--tool-call-parser qwen3_coder`) — the combination
+behind the reported token-ID-0 `!!!!` loop:
+
+| run | turns | wall | context | result |
+|---|---|---|---|---|
+| 1 (2048 cap) | 100 | 30.3 min | 475 → 255k tokens | 0 degeneracy flags; reasoning novelty never collapses |
+| 2 (8192 cap, reasoning persisted) | 60 | 22.6 min | 475 → 159k tokens | 1/60 turns capped; that turn is a **heavy tail** per `loop_detector`; aggregate no collapse |
+
+Run 1's 14/100 capped turns are budget truncation, not a loop: raised to an 8192 cap in
+run 2 only one turn capped, and its reasoning stays novel to the end (word 8-gram novelty
+never falls below the loop threshold for three consecutive windows). **The token-0
+degeneracy did not reproduce on this vLLM + FP8-KV lane across ~53 minutes and 160 turns
+of agentic thinking+tools.**
+
 ## Status
 
 - Branch `ple-offload-fp8` is pushed to the fork (`Capicua25x`) and tracks draft
@@ -323,8 +366,9 @@ grows, and that is the remaining open measurement.
 - Newest commits: the public-surface scrub (neutral node labels + pseudonymous
   committer identity, 2026-09-14) and the quality/YaRN-tax section above.
 - Validated: boot topology, generations, EP/chunk sweep, 1M needle, quality suite,
-  YaRN tax, long-context load (3x400k concurrent + 989k deep single). Optional
-  follow-ups: a 3-round/4-level sweep confirmation and a long thinking+tools soak.
+  YaRN tax, long-context load (3x400k concurrent + 989k deep single), needles at 95%
+  depth under load, AA-LCR depth reasoning (0.81), and a 160-turn thinking+tools soak
+  with no token-0 loop. Open: the optional 3-round/4-level sweep and the `nnodes=1` boot.
 
 ## Credits
 
