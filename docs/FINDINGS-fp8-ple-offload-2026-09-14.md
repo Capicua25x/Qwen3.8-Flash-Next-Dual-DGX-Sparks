@@ -271,6 +271,24 @@ of 80, single seed; GSM8K saturates at 0.98). It does not show the seed-consiste
 higher-resolution tax number needs 5 seeds and a non-saturating cell; depth *reasoning*
 quality remains unmeasured (the 937k needle proves retrieval, not reasoning at depth).
 
+## Long-context load (2026-09-15)
+
+Two-stage load on the 1M/YaRN lane (`lc_load.py`, filed in `~/q38bench/` on the head):
+concurrent mid-depth requests and one deep single, each carrying a distinct needle at
+50% depth; pass = the code echoed back exactly.
+
+| stage | shape | result |
+|---|---|---|
+| 1 | 3 concurrent x ~400k tokens (1.2M total) | all 3 needles found; TTFT 206 / 406 / 609 s (one stream queued on capacity, then preempt-recomputed); wall 611 s |
+| 2 | single x ~989k tokens | PASS; TTFT 667.7 s (1,481 tok/s prefill) |
+
+Engine across both: 0 errors, 2 preemptions total (recovered, all answers exact),
+KV integrity intact, no `shm_broadcast` warnings during serving (those are boot-warmup
+only), pool drained to 0 after. Read: correctness holds at depth under load; the
+limiter is capacity - ~2 concurrent 400k-class streams fit comfortably, the third
+queues - and aggregate prefill does not scale with concurrency (~1,960 tok/s across
+stage 1 vs ~1.5-2k single-stream): prefill-bound, consistent with the sweep.
+
 ## Status
 
 - Branch `ple-offload-fp8` is pushed to the fork (`Capicua25x`) and tracks draft
@@ -278,8 +296,8 @@ quality remains unmeasured (the 937k needle proves retrieval, not reasoning at d
 - Newest commits: the public-surface scrub (neutral node labels + pseudonymous
   committer identity, 2026-09-14) and the quality/YaRN-tax section above.
 - Validated: boot topology, generations, EP/chunk sweep, 1M needle, quality suite,
-  YaRN tax. Optional follow-ups (not blockers): a 3-round/4-level sweep confirmation,
-  a long thinking+tools soak, and an nnodes=1 regression boot.
+  YaRN tax, long-context load (3x400k concurrent + 989k deep single). Optional
+  follow-ups: a 3-round/4-level sweep confirmation and a long thinking+tools soak.
 
 ## Credits
 
