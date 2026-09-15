@@ -133,12 +133,10 @@ transport-correct option.
 
 **Boot-validated on hardware (2026-09-14):** node-local registrations on both nodes,
 `:8888` serving, real generations with zero worker errors, and a 1M-context needle run
-(see the "UPDATE — validation boot" and "1M context" sections below). Still **open**:
-
-- single-node regression (nnodes=1) — the TP1 lane's own copies are untouched and the
-  single-node path is analytically unchanged (leader = TP0 of each DP group,
-  `local_world_size == dp*tp`); not booted because the full FP8 checkpoint does not fit
-  one device.
+(see the "UPDATE — validation boot" and "1M context" sections below). The single-node
+(`nnodes=1`) regression and the remaining quality/soak items were closed on 2026-09-15
+(see the depth-reasoning section below); the only open item is the optional 3-round/4-level
+sweep confirmation.
 
 **Safety rails worked:** cgroup cap held at 40.0 GiB; memwatch logged
 `avail=44948MiB ... container=40956MiB` throughout; host MemAvailable stayed
@@ -359,6 +357,22 @@ never falls below the loop threshold for three consecutive windows). **The token
 degeneracy did not reproduce on this vLLM + FP8-KV lane across ~53 minutes and 160 turns
 of agentic thinking+tools.**
 
+**Single-node (`nnodes=1`) regression.** The patched files were booted at TP1 on one Spark
+with the smaller NVFP4 checkpoint (`local-inference-lab/Qwen3.8-Flash-Next-NVFP4` — the
+only Qwen3.8-Flash-Next checkpoint that fits one device; ~98.6 GiB on disk, PLE table
+mmap-offloaded). The node-local topology degenerates to the single-node path exactly:
+
+    waiting for 1 GPU worker registration(s)
+    GPU worker 0 registered (dp_rank=0, tp_rank=0)
+    Registrations complete (dp_size=1, tp_size=1)
+    Busy-loop started.
+
+Served `:8888`, KV 328,790 tokens (262,144 native), a chat completion and a thinking+tools
+turn both OK. Scope: this exercises the topology/accounting/leader changes, which are
+quantization-agnostic; the FP8 `ple_layer` dtype branch takes the uint8 path on an NVFP4
+checkpoint, so the FP8-specific branch at TP1 stays untestable by construction (FP8 does
+not fit one device).
+
 ## Status
 
 - Branch `ple-offload-fp8` is pushed to the fork (`Capicua25x`) and tracks draft
@@ -367,8 +381,9 @@ of agentic thinking+tools.**
   committer identity, 2026-09-14) and the quality/YaRN-tax section above.
 - Validated: boot topology, generations, EP/chunk sweep, 1M needle, quality suite,
   YaRN tax, long-context load (3x400k concurrent + 989k deep single), needles at 95%
-  depth under load, AA-LCR depth reasoning (0.81), and a 160-turn thinking+tools soak
-  with no token-0 loop. Open: the optional 3-round/4-level sweep and the `nnodes=1` boot.
+  depth under load, AA-LCR depth reasoning (0.81), a 160-turn thinking+tools soak with
+  no token-0 loop, and the single-node (`nnodes=1`) regression at TP1. Open: the optional
+  3-round/4-level sweep.
 
 ## Credits
 
