@@ -245,14 +245,41 @@ Two process notes carried over from the run:
   issue #24, confirmed live): the aborted first attempt still consumed a full 937k
   prefill. Do not kill streaming tests; let them time out.
 
+## Quality pass and the YaRN tax (2026-09-14/15)
+
+Two quality measurements on the lane, both at the 1M/YaRN config unless noted:
+
+**Reasoning/retrieval suite (`bench/reasoning_check.py`) — 12/12 PASS**: 8 reasoning
+tasks, 2 math, plus needles at 8k and 64k; greedy (`temperature=0`), thinking off on
+this lane. Every deterministic task correct.
+
+**YaRN tax A/B** — same checkpoint, same serve script; lm-eval on-spec sampling
+(thinking ON, temperature 1.0 / top_p 0.95 / top_k 20, seed 1234, 16k generation cap),
+the 1M/YaRN config vs native 262k (YaRN off):
+
+| cell | 1M / YaRN | native 262k |
+|---|---|---|
+| GSM8K n=50 flex / strict | 0.98 / 0.98 | 0.98 / 0.98 |
+| IFEval n=80 inst loose | 0.9531 | 0.9375 |
+| IFEval n=80 inst strict | 0.9453 | 0.9375 |
+| IFEval n=80 prompt loose | 0.9250 | 0.9250 |
+| IFEval n=80 prompt strict | 0.9125 | 0.9250 |
+
+Read: the extension's short-context cost is below this protocol's resolution (+/-1 item
+of 80, single seed; GSM8K saturates at 0.98). It does not show the seed-consistent
+2-4 IFEval points Muse-Glimmer-30B measured for its own YaRN extension. A
+higher-resolution tax number needs 5 seeds and a non-saturating cell; depth *reasoning*
+quality remains unmeasured (the 937k needle proves retrieval, not reasoning at depth).
+
 ## Status
 
 - Branch `ple-offload-fp8` is pushed to the fork (`Capicua25x`) and tracks draft
   PR #54 to MiaAI-Lab; discussion thread: issue #55.
-- Newest local commit on top of the pushed head: `5aadc80` (bench tools take
-  `--model` instead of hardcoding the NVFP4 served name).
-- Remaining before merge-ready: the quality suite, the agentic soak, and the
-  nnodes=1 regression listed under "Validation status".
+- Newest commits: the public-surface scrub (neutral node labels + pseudonymous
+  committer identity, 2026-09-14) and the quality/YaRN-tax section above.
+- Validated: boot topology, generations, EP/chunk sweep, 1M needle, quality suite,
+  YaRN tax. Optional follow-ups (not blockers): a 3-round/4-level sweep confirmation,
+  a long thinking+tools soak, and an nnodes=1 regression boot.
 
 ## Credits
 
