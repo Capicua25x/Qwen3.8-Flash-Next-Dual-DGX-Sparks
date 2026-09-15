@@ -289,6 +289,33 @@ limiter is capacity - ~2 concurrent 400k-class streams fit comfortably, the thir
 queues - and aggregate prefill does not scale with concurrency (~1,960 tok/s across
 stage 1 vs ~1.5-2k single-stream): prefill-bound, consistent with the sweep.
 
+### Table placement - what it costs
+
+The FP8 lane runs the 47.68 GiB PLE table as a demand-paged mmap of the packed file on
+each node's NVMe; loading it into RAM is not a slower option, it is a non-option:
+62.5 GiB of weights + 47.68 GiB of table + KV exceeds the 121.6 GiB unified pool, and
+the table alone exceeds the 40 GiB container cap.
+
+For the same design family, Tony's TP2 ledger carries the clean RAM-vs-disk delta:
+table resident (SPEED) 53.7 tok/s single-stream / 97.9 aggregate at six / KV 1.97M vs
+table on disk (CONTEXT) 35.8 / 65.5 / KV 5.87M - the disk table costs ~33% of decode
+and buys ~3x the KV pool. Ours is a different mechanism (mmap page-in vs his per-step
+preadv gather), so the applicable number is the mmap's own cold-vs-warm cost. Measured
+with the table pages dropped from the page cache on both nodes:
+
+| phase | TTFT @ ~100k tokens | wall |
+|---|---|---|
+| prime | 40.3 s | 41.6 s |
+| warm (pages cached) | 40.5 s | 42.4 s |
+| cold (drop_caches both nodes) | 40.2 s | 42.0 s |
+
+Read: no measurable cold-vs-warm penalty at this scale - page-in is below resolution
+next to the prefill cost, consistent with a working set small relative to the page
+cache (47.7 GiB file, 22-42 GiB of cache while serving). The ~33% figure belongs to
+Tony's per-step gather (and to the compile-off pairing that profile requires), not to
+demand paging as such. A deeper cold probe (500k+) was not run; at 1M the working set
+grows, and that is the remaining open measurement.
+
 ## Status
 
 - Branch `ple-offload-fp8` is pushed to the fork (`Capicua25x`) and tracks draft
