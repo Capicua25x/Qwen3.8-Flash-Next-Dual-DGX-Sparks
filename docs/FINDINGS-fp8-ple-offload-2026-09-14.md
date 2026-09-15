@@ -321,7 +321,7 @@ grows, and that is the remaining open measurement.
 Three follow-ups, all on the same lane (FP8 weights, node-local PLE offload, 1M/YaRN,
 EP off, chunk 8192, GMU 0.70).
 
-**Needles at 95% depth *under load*.** `bench/lc_load.py` gained a `--depth` argument (the
+**Needles at 95% depth *under load*.** `lc_load.py` gained a `--depth` argument (the
 first version pinned the needle at 50% depth). Needles at **95% depth**:
 
 | stage | shape | result |
