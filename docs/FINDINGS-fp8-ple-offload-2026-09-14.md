@@ -134,9 +134,9 @@ transport-correct option.
 **Boot-validated on hardware (2026-09-14):** node-local registrations on both nodes,
 `:8888` serving, real generations with zero worker errors, and a 1M-context needle run
 (see the "UPDATE — validation boot" and "1M context" sections below). The single-node
-(`nnodes=1`) regression and the remaining quality/soak items were closed on 2026-09-15
-(see the depth-reasoning section below); the only open item is the optional 3-round/4-level
-sweep confirmation.
+(`nnodes=1`) regression, the remaining quality/soak items, and the optional 3-round/4-level
+sweep were all closed on 2026-09-15 (see the depth-reasoning section below); no items remain
+open.
 
 **Safety rails worked:** cgroup cap held at 40.0 GiB; memwatch logged
 `avail=44948MiB ... container=40956MiB` throughout; host MemAvailable stayed
@@ -373,6 +373,21 @@ quantization-agnostic; the FP8 `ple_layer` dtype branch takes the uint8 path on 
 checkpoint, so the FP8-specific branch at TP1 stays untestable by construction (FP8 does
 not fit one device).
 
+**Optional sweep confirmation (3 rounds, 4 levels).** The shipped config (EP off, chunk
+8192) re-run at higher fidelity — thinking on, levels 1/2/4/6 (agg tok/s / TTFT):
+
+| level | mix | long |
+|---|---|---|
+| c1 | 39.7 / 3.13 s | 11.9 / 2.19 s |
+| c2 | 51.9 / 5.99 s | 13.9 / 3.93 s |
+| c4 | 66.6 / 7.99 s | 15.5 / 7.50 s |
+| c6 | 85.0 / 22.87 s | 15.9 / 11.08 s |
+
+Against the original 2-round / levels-1/6 numbers (mix c1 35.4, c6 73.8; long c1 12.6,
+c6 16.6) the shipped config sits within run-to-run spread — mix slightly better, long
+slightly lower — and the c2/c4 points fill in the curve. No regression; the config choice
+stands.
+
 ## Status
 
 - Branch `ple-offload-fp8` is pushed to the fork (`Capicua25x`) and tracks draft
@@ -382,8 +397,8 @@ not fit one device).
 - Validated: boot topology, generations, EP/chunk sweep, 1M needle, quality suite,
   YaRN tax, long-context load (3x400k concurrent + 989k deep single), needles at 95%
   depth under load, AA-LCR depth reasoning (0.81), a 160-turn thinking+tools soak with
-  no token-0 loop, and the single-node (`nnodes=1`) regression at TP1. Open: the optional
-  3-round/4-level sweep.
+  no token-0 loop, the single-node (`nnodes=1`) regression at TP1, and the 3-round/4-level
+  sweep confirmation. No items remain open.
 
 ## Credits
 
